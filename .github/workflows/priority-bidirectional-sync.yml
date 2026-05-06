@@ -8,6 +8,7 @@ on:
   workflow_dispatch:        # manual trigger
 
 permissions:
+  contents: read
   issues: write
   repository-projects: write
 
