@@ -1,67 +1,72 @@
-name: Priority Bidirectional Sync
+name: Priority Sync (Bidirectional)
 
 on:
   issues:
     types: [labeled, unlabeled]
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:   # 👈 add this
+    - cron: "*/5 * * * *"   # every 5 minutes
+  workflow_dispatch:        # manual trigger
 
-concurrency:
-  group: priority-sync-${{ github.event.issue.number || github.event.project_v2_item.id }}
-  cancel-in-progress: true
+permissions:
+  issues: write
+  repository-projects: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Install gh
-        run: sudo apt-get install -y gh
+    env:
+      PROJECT_ID: ${{ secrets.PROJECT_ID }}
+      PRIORITY_FIELD_ID: ${{ secrets.PRIORITY_FIELD_ID }}
+      P0_OPTION_ID: ${{ secrets.P0_OPTION_ID }}
+      P1_OPTION_ID: ${{ secrets.P1_OPTION_ID }}
+      P2_OPTION_ID: ${{ secrets.P2_OPTION_ID }}
 
-      - name: Determine event type
+    steps:
+      - name: Install gh + jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh jq
+
+      - name: Auth gh
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+
+      - name: Detect event
         id: event
         run: |
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            echo "type=issue" >> $GITHUB_OUTPUT
-          else
-            echo "type=project" >> $GITHUB_OUTPUT
-          fi
+          echo "event=${{ github.event_name }}" >> $GITHUB_OUTPUT
 
-      # ----------------------------
-      # ISSUE → PROJECT
-      # ----------------------------
+      # =====================================================
+      # 🔁 ISSUE → PROJECT
+      # =====================================================
       - name: Sync Issue → Project
-        if: steps.event.outputs.type == 'issue'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROJECT_ID: ${{ secrets.PROJECT_ID }}
-          FIELD_ID: ${{ secrets.PRIORITY_FIELD_ID }}
-          P0: ${{ secrets.P0_OPTION_ID }}
-          P1: ${{ secrets.P1_OPTION_ID }}
-          P2: ${{ secrets.P2_OPTION_ID }}
+        if: steps.event.outputs.event == 'issues'
         run: |
           ISSUE_NUMBER=${{ github.event.issue.number }}
           REPO=${{ github.repository }}
 
+          echo "Processing issue #$ISSUE_NUMBER"
+
           LABELS=$(gh issue view $ISSUE_NUMBER --repo $REPO --json labels -q '.labels[].name')
 
-          PRIORITY=$(echo "$LABELS" | grep -Eo 'P0|P1|P2' | head -n 1 || true)
-
-          echo "Detected label priority: $PRIORITY"
+          PRIORITY=$(echo "$LABELS" | grep -Eo '^P0|P1|P2$' | head -n 1 || true)
 
           if [ -z "$PRIORITY" ]; then
             echo "No priority label found"
             exit 0
           fi
 
+          echo "Detected priority: $PRIORITY"
+
           case "$PRIORITY" in
-            P0) OPTION=$P0 ;;
-            P1) OPTION=$P1 ;;
-            P2) OPTION=$P2 ;;
+            P0) OPTION_ID=$P0_OPTION_ID ;;
+            P1) OPTION_ID=$P1_OPTION_ID ;;
+            P2) OPTION_ID=$P2_OPTION_ID ;;
           esac
 
-          ISSUE_NODE_ID=$(gh issue view $ISSUE_NUMBER --repo $REPO --json node_id -q .node_id)
+          ISSUE_NODE_ID=$(gh issue view $ISSUE_NUMBER --repo $REPO --json id -q .id)
+
+          echo "Updating project field..."
 
           gh api graphql -f query='
           mutation($project:ID!, $item:ID!, $field:ID!, $option:ID!) {
@@ -74,70 +79,98 @@ jobs:
               projectV2Item { id }
             }
           }' \
-          -f project=$PROJECT_ID \
-          -f item=$ISSUE_NODE_ID \
-          -f field=$FIELD_ID \
-          -f option=$OPTION
+          -f project="$PROJECT_ID" \
+          -f item="$ISSUE_NODE_ID" \
+          -f field="$PRIORITY_FIELD_ID" \
+          -f option="$OPTION_ID"
 
-      # ----------------------------
-      # PROJECT → ISSUE
-      # ----------------------------
-      - name: Sync Project → Issue
-        if: steps.event.outputs.type == 'project'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROJECT_ID: ${{ secrets.PROJECT_ID }}
-          FIELD_ID: ${{ secrets.PRIORITY_FIELD_ID }}
+      # =====================================================
+      # 🔁 PROJECT → ISSUE (Scheduled / Manual)
+      # =====================================================
+      - name: Sync Project → Issues
+        if: steps.event.outputs.event != 'issues'
         run: |
-          ITEM_ID="${{ github.event.project_v2_item.id }}"
+          echo "Fetching project items..."
 
-          DATA=$(gh api graphql -f query='
-          query($project:ID!, $item:ID!) {
+          ITEMS=$(gh api graphql -f query='
+          query($project: ID!) {
             node(id: $project) {
               ... on ProjectV2 {
-                item(id: $item) {
+                items(first: 50) {
+                  nodes {
+                    id
+                  }
+                }
+              }
+            }
+          }' -f project="$PROJECT_ID" --jq '.data.node.items.nodes[].id')
+
+          for ITEM_ID in $ITEMS; do
+            echo "Processing item: $ITEM_ID"
+
+            DATA=$(gh api graphql -f query='
+            query($item: ID!) {
+              node(id: $item) {
+                ... on ProjectV2Item {
                   content {
                     ... on Issue {
                       number
-                      repository { nameWithOwner }
-                      id
+                      repository {
+                        nameWithOwner
+                      }
                     }
                   }
                   fieldValues(first: 20) {
                     nodes {
                       ... on ProjectV2ItemFieldSingleSelectValue {
                         name
-                        field { ... on ProjectV2SingleSelectField { id } }
+                        field {
+                          ... on ProjectV2SingleSelectField {
+                            id
+                          }
+                        }
                       }
                     }
                   }
                 }
               }
-            }
-          }' \
-          -f project=$PROJECT_ID \
-          -f item=$ITEM_ID)
+            }' -f item="$ITEM_ID")
 
-          ISSUE_NUMBER=$(echo "$DATA" | jq -r '.data.node.item.content.number')
-          REPO=$(echo "$DATA" | jq -r '.data.node.item.content.repository.nameWithOwner')
+            ISSUE_NUMBER=$(echo "$DATA" | jq -r '.data.node.content.number')
+            REPO=$(echo "$DATA" | jq -r '.data.node.content.repository.nameWithOwner')
 
-          PRIORITY=$(echo "$DATA" | jq -r '
-            .data.node.item.fieldValues.nodes[]
-            | select(.field.id == "'"$FIELD_ID"'")
-            | .name
-          ')
+            if [ "$ISSUE_NUMBER" = "null" ]; then
+              echo "Skipping non-issue item"
+              continue
+            fi
 
-          echo "Project priority: $PRIORITY"
+            PRIORITY=$(echo "$DATA" | jq -r '
+              .data.node.fieldValues.nodes[]
+              | select(.field.id == "'"$PRIORITY_FIELD_ID"'")
+              | .name
+            ')
 
-          if [ "$PRIORITY" = "null" ] || [ -z "$PRIORITY" ]; then
-            echo "No project priority"
-            exit 0
-          fi
+            if [ -z "$PRIORITY" ] || [ "$PRIORITY" = "null" ]; then
+              echo "No priority set"
+              continue
+            fi
 
-          # Remove all old priority labels first (prevents duplicates)
-          gh issue edit $ISSUE_NUMBER --repo $REPO \
-            --remove-label P0 --remove-label P1 --remove-label P2 || true
+            echo "Priority: $PRIORITY"
 
-          # Add correct label
-          gh issue edit $ISSUE_NUMBER --repo $REPO \
-            --add-label "$PRIORITY"
+            CURRENT=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels -q '.labels[].name')
+
+            if echo "$CURRENT" | grep -q "^$PRIORITY$"; then
+              echo "Already synced, skipping"
+              continue
+            fi
+
+            echo "Updating labels..."
+
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
+              --remove-label P0 --remove-label P1 --remove-label P2 || true
+
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
+              --add-label "$PRIORITY"
+
+            sleep 0.2
+          done
