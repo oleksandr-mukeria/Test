@@ -4,19 +4,17 @@ on:
   issues:
     types: [labeled, unlabeled]
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
-  workflow_dispatch:        # manual trigger
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
   issues: write
-  projects: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
-    environment: test   # 👈 THIS IS REQUIRED
+    environment: test
 
     env:
       PROJECT_ID: ${{ secrets.PROJECT_ID }}
@@ -26,18 +24,24 @@ jobs:
       P2_OPTION_ID: ${{ secrets.P2_OPTION_ID }}
 
     steps:
-      - name: Install gh + jq
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y gh jq
 
-      - name: Auth gh
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+      # =========================
+      # AUTH FIX (IMPORTANT)
+      # =========================
+      - name: Auth GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | gh auth login --with-token
+          gh auth status
 
       - name: Detect event
         id: event
-        run: |
-          echo "event=${{ github.event_name }}" >> $GITHUB_OUTPUT
+        run: echo "event=${{ github.event_name }}" >> $GITHUB_OUTPUT
 
       # =====================================================
       # 🔁 ISSUE → PROJECT
@@ -45,14 +49,16 @@ jobs:
       - name: Sync Issue → Project
         if: steps.event.outputs.event == 'issues'
         run: |
-          ISSUE_NUMBER=${{ github.event.issue.number }}
-          REPO=${{ github.repository }}
+          set -e
+
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          REPO="${{ github.repository }}"
 
           echo "Processing issue #$ISSUE_NUMBER"
 
-          LABELS=$(gh issue view $ISSUE_NUMBER --repo $REPO --json labels -q '.labels[].name')
+          LABELS=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels -q '.labels[].name')
 
-          PRIORITY=$(echo "$LABELS" | grep -Eo '^P0|P1|P2$' | head -n 1 || true)
+          PRIORITY=$(echo "$LABELS" | grep -E '^P0$|^P1$|^P2$' | head -n 1 || true)
 
           if [ -z "$PRIORITY" ]; then
             echo "No priority label found"
@@ -67,12 +73,12 @@ jobs:
             P2) OPTION_ID=$P2_OPTION_ID ;;
           esac
 
-          ISSUE_NODE_ID=$(gh issue view $ISSUE_NUMBER --repo $REPO --json id -q .id)
+          ISSUE_NODE_ID=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json id -q .id)
 
           echo "Updating project field..."
 
           gh api graphql -f query='
-          mutation($project:ID!, $item:ID!, $field:ID!, $option:ID!) {
+          mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
             updateProjectV2ItemFieldValue(input: {
               projectId: $project,
               itemId: $item,
@@ -88,22 +94,20 @@ jobs:
           -f option="$OPTION_ID"
 
       # =====================================================
-      # 🔁 PROJECT → ISSUE (Scheduled / Manual)
+      # 🔁 PROJECT → ISSUE
       # =====================================================
       - name: Sync Project → Issues
         if: steps.event.outputs.event != 'issues'
         run: |
-          echo "Fetching project items..."
           set -e
 
-          : "${PROJECT_ID:?PROJECT_ID is missing}"
-          : "${PRIORITY_FIELD_ID:?PRIORITY_FIELD_ID is missing}"
+          echo "Fetching project items..."
 
-          ITEMS=$(gh api graphql -f query='
+          ITEM_IDS=$(gh api graphql -f query='
           query($project: ID!) {
             node(id: $project) {
               ... on ProjectV2 {
-                items(first: 50) {
+                items(first: 100) {
                   nodes {
                     id
                   }
@@ -112,7 +116,7 @@ jobs:
             }
           }' -f project="$PROJECT_ID" --jq '.data.node.items.nodes[].id')
 
-          for ITEM_ID in $ITEMS; do
+          for ITEM_ID in $ITEM_IDS; do
             echo "Processing item: $ITEM_ID"
 
             DATA=$(gh api graphql -f query='
@@ -146,7 +150,7 @@ jobs:
             ISSUE_NUMBER=$(echo "$DATA" | jq -r '.data.node.content.number')
             REPO=$(echo "$DATA" | jq -r '.data.node.content.repository.nameWithOwner')
 
-            if [ "$ISSUE_NUMBER" = "null" ]; then
+            if [ "$ISSUE_NUMBER" = "null" ] || [ -z "$ISSUE_NUMBER" ]; then
               echo "Skipping non-issue item"
               continue
             fi
@@ -158,16 +162,13 @@ jobs:
             ')
 
             if [ -z "$PRIORITY" ] || [ "$PRIORITY" = "null" ]; then
-              echo "No priority set"
               continue
             fi
-
-            echo "Priority: $PRIORITY"
 
             CURRENT=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels -q '.labels[].name')
 
             if echo "$CURRENT" | grep -q "^$PRIORITY$"; then
-              echo "Already synced, skipping"
+              echo "Already synced"
               continue
             fi
 
@@ -178,6 +179,4 @@ jobs:
 
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
               --add-label "$PRIORITY"
-
-            sleep 0.2
           done
