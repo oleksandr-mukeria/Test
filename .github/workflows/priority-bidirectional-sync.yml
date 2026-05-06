@@ -1,0 +1,142 @@
+name: Priority Bidirectional Sync
+
+on:
+  issues:
+    types: [labeled, unlabeled]
+  project_v2_item:
+    types: [edited]
+
+concurrency:
+  group: priority-sync-${{ github.event.issue.number || github.event.project_v2_item.id }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install gh
+        run: sudo apt-get install -y gh
+
+      - name: Determine event type
+        id: event
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "type=issue" >> $GITHUB_OUTPUT
+          else
+            echo "type=project" >> $GITHUB_OUTPUT
+          fi
+
+      # ----------------------------
+      # ISSUE → PROJECT
+      # ----------------------------
+      - name: Sync Issue → Project
+        if: steps.event.outputs.type == 'issue'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          FIELD_ID: ${{ secrets.PRIORITY_FIELD_ID }}
+          P0: ${{ secrets.P0_OPTION_ID }}
+          P1: ${{ secrets.P1_OPTION_ID }}
+          P2: ${{ secrets.P2_OPTION_ID }}
+        run: |
+          ISSUE_NUMBER=${{ github.event.issue.number }}
+          REPO=${{ github.repository }}
+
+          LABELS=$(gh issue view $ISSUE_NUMBER --repo $REPO --json labels -q '.labels[].name')
+
+          PRIORITY=$(echo "$LABELS" | grep -Eo 'P0|P1|P2' | head -n 1 || true)
+
+          echo "Detected label priority: $PRIORITY"
+
+          if [ -z "$PRIORITY" ]; then
+            echo "No priority label found"
+            exit 0
+          fi
+
+          case "$PRIORITY" in
+            P0) OPTION=$P0 ;;
+            P1) OPTION=$P1 ;;
+            P2) OPTION=$P2 ;;
+          esac
+
+          ISSUE_NODE_ID=$(gh issue view $ISSUE_NUMBER --repo $REPO --json node_id -q .node_id)
+
+          gh api graphql -f query='
+          mutation($project:ID!, $item:ID!, $field:ID!, $option:ID!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $project,
+              itemId: $item,
+              fieldId: $field,
+              value: { singleSelectOptionId: $option }
+            }) {
+              projectV2Item { id }
+            }
+          }' \
+          -f project=$PROJECT_ID \
+          -f item=$ISSUE_NODE_ID \
+          -f field=$FIELD_ID \
+          -f option=$OPTION
+
+      # ----------------------------
+      # PROJECT → ISSUE
+      # ----------------------------
+      - name: Sync Project → Issue
+        if: steps.event.outputs.type == 'project'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          FIELD_ID: ${{ secrets.PRIORITY_FIELD_ID }}
+        run: |
+          ITEM_ID="${{ github.event.project_v2_item.id }}"
+
+          DATA=$(gh api graphql -f query='
+          query($project:ID!, $item:ID!) {
+            node(id: $project) {
+              ... on ProjectV2 {
+                item(id: $item) {
+                  content {
+                    ... on Issue {
+                      number
+                      repository { nameWithOwner }
+                      id
+                    }
+                  }
+                  fieldValues(first: 20) {
+                    nodes {
+                      ... on ProjectV2ItemFieldSingleSelectValue {
+                        name
+                        field { ... on ProjectV2SingleSelectField { id } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }' \
+          -f project=$PROJECT_ID \
+          -f item=$ITEM_ID)
+
+          ISSUE_NUMBER=$(echo "$DATA" | jq -r '.data.node.item.content.number')
+          REPO=$(echo "$DATA" | jq -r '.data.node.item.content.repository.nameWithOwner')
+
+          PRIORITY=$(echo "$DATA" | jq -r '
+            .data.node.item.fieldValues.nodes[]
+            | select(.field.id == "'"$FIELD_ID"'")
+            | .name
+          ')
+
+          echo "Project priority: $PRIORITY"
+
+          if [ "$PRIORITY" = "null" ] || [ -z "$PRIORITY" ]; then
+            echo "No project priority"
+            exit 0
+          fi
+
+          # Remove all old priority labels first (prevents duplicates)
+          gh issue edit $ISSUE_NUMBER --repo $REPO \
+            --remove-label P0 --remove-label P1 --remove-label P2 || true
+
+          # Add correct label
+          gh issue edit $ISSUE_NUMBER --repo $REPO \
+            --add-label "$PRIORITY"
