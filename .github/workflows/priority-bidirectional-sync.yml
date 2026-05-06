@@ -15,6 +15,8 @@ jobs:
   sync:
     runs-on: ubuntu-latest
 
+    environment: test   # 👈 THIS IS REQUIRED
+
     env:
       PROJECT_ID: ${{ secrets.PROJECT_ID }}
       PRIORITY_FIELD_ID: ${{ secrets.PRIORITY_FIELD_ID }}
