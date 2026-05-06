@@ -3,8 +3,9 @@ name: Priority Bidirectional Sync
 on:
   issues:
     types: [labeled, unlabeled]
-  project_v2_item:
-    types: [edited]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:   # 👈 add this
 
 concurrency:
   group: priority-sync-${{ github.event.issue.number || github.event.project_v2_item.id }}
