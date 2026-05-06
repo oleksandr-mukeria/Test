@@ -91,6 +91,10 @@ jobs:
         if: steps.event.outputs.event != 'issues'
         run: |
           echo "Fetching project items..."
+          set -e
+
+          : "${PROJECT_ID:?PROJECT_ID is missing}"
+          : "${PRIORITY_FIELD_ID:?PRIORITY_FIELD_ID is missing}"
 
           ITEMS=$(gh api graphql -f query='
           query($project: ID!) {
