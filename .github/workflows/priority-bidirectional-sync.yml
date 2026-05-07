@@ -35,9 +35,7 @@ jobs:
       - name: Auth GitHub CLI
         env:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-        run: |
-          echo "$GH_TOKEN" | gh auth login --with-token
-          gh auth status
+        run: gh auth status
 
       - name: Detect event
         id: event
