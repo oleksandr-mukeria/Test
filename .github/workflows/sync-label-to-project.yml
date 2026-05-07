@@ -1,0 +1,157 @@
+# ============================================================
+# Sync Priority Label → Project Field
+# ============================================================
+# Place this file in ALL repos that have issues linked to the project.
+#
+# ENVIRONMENT (dev):
+#   Secrets:   PROJECT_TOKEN  (classic PAT: repo + project + read:org if org)
+#   Variables: OWNER_NAME, OWNER_TYPE, PROJECT_NUMBER, FIELD_NAME
+# ============================================================
+
+name: Sync Priority Label → Project Field
+
+on:
+  issues:
+    types: [labeled, unlabeled]
+
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to sync"
+        required: true
+        type: number
+
+jobs:
+  label-to-project:
+    name: "Label → Project Field"
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      issues: read
+    steps:
+      - name: Sync priority label to project field
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const PRIORITIES = ['P0', 'P1', 'P2'];
+            const ownerName  = '${{ vars.OWNER_NAME }}';
+            const ownerType  = '${{ vars.OWNER_TYPE }}';
+            const projectNum = parseInt('${{ vars.PROJECT_NUMBER }}', 10);
+            const fieldName  = '${{ vars.FIELD_NAME }}';
+
+            // ── Resolve issue (event vs manual trigger) ────────────────────
+            let issueNodeId, activeLabel, issueNumber;
+
+            if (context.eventName === 'workflow_dispatch') {
+              issueNumber = parseInt(context.payload.inputs.issue_number, 10);
+              const { repository } = await github.graphql(`
+                query($owner: String!, $repo: String!, $num: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $num) {
+                      id
+                      labels(first: 30) { nodes { name } }
+                    }
+                  }
+                }
+              `, { owner: context.repo.owner, repo: context.repo.repo, num: issueNumber });
+
+              issueNodeId = repository.issue.id;
+              activeLabel = repository.issue.labels.nodes
+                .map(l => l.name).find(n => PRIORITIES.includes(n)) ?? null;
+            } else {
+              const issue = context.payload.issue;
+              issueNumber = issue.number;
+              issueNodeId = issue.node_id;
+              activeLabel = issue.labels
+                .map(l => l.name).find(n => PRIORITIES.includes(n)) ?? null;
+            }
+
+            core.info(`[${context.repo.repo}] Issue #${issueNumber} — priority label: ${activeLabel ?? '(none)'}`);
+
+            // ── Fetch project metadata ─────────────────────────────────────
+            const projectQuery = ownerType === 'org'
+              ? `query($owner: String!, $num: Int!) {
+                   organization(login: $owner) {
+                     projectV2(number: $num) { id fields(first: 50) { nodes {
+                       ... on ProjectV2SingleSelectField { id name options { id name } }
+                     }}}
+                   }
+                 }`
+              : `query($owner: String!, $num: Int!) {
+                   user(login: $owner) {
+                     projectV2(number: $num) { id fields(first: 50) { nodes {
+                       ... on ProjectV2SingleSelectField { id name options { id name } }
+                     }}}
+                   }
+                 }`;
+
+            const projectData = await github.graphql(projectQuery, { owner: ownerName, num: projectNum });
+            const project = (ownerType === 'org' ? projectData.organization : projectData.user).projectV2;
+            const field   = project.fields.nodes.find(f => f.name === fieldName);
+
+            if (!field) {
+              core.setFailed(
+                `Field "${fieldName}" not found. ` +
+                `Available: ${project.fields.nodes.map(f => f.name).filter(Boolean).join(', ')}`
+              );
+              return;
+            }
+
+            // ── Find the project item linked to this issue ─────────────────
+            const { node } = await github.graphql(`
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on Issue {
+                    projectItems(first: 20) {
+                      nodes { id project { id } }
+                    }
+                  }
+                }
+              }
+            `, { id: issueNodeId });
+
+            const projectItem = node.projectItems.nodes
+              .find(item => item.project.id === project.id);
+
+            if (!projectItem) {
+              core.warning(`Issue #${issueNumber} is not in project #${projectNum} — skipping.`);
+              return;
+            }
+
+            // ── Apply or clear the project field ───────────────────────────
+            if (activeLabel) {
+              const option = field.options.find(o => o.name === activeLabel);
+              if (!option) {
+                core.setFailed(
+                  `Option "${activeLabel}" not found. ` +
+                  `Available: ${field.options.map(o => o.name).join(', ')}`
+                );
+                return;
+              }
+
+              await github.graphql(`
+                mutation($pid: ID!, $iid: ID!, $fid: ID!, $oid: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $pid
+                    itemId: $iid
+                    fieldId: $fid
+                    value: { singleSelectOptionId: $oid }
+                  }) { projectV2Item { id } }
+                }
+              `, { pid: project.id, iid: projectItem.id, fid: field.id, oid: option.id });
+
+              core.info(`✅  [${context.repo.repo}] Set "${fieldName}" → "${activeLabel}" for issue #${issueNumber}`);
+            } else {
+              await github.graphql(`
+                mutation($pid: ID!, $iid: ID!, $fid: ID!) {
+                  clearProjectV2ItemFieldValue(input: {
+                    projectId: $pid
+                    itemId: $iid
+                    fieldId: $fid
+                  }) { projectV2Item { id } }
+                }
+              `, { pid: project.id, iid: projectItem.id, fid: field.id });
+
+              core.info(`✅  [${context.repo.repo}] Cleared "${fieldName}" for issue #${issueNumber}`);
+            }
