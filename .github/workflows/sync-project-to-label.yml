@@ -1,12 +1,14 @@
 # ============================================================
 # Sync Project Field → Priority Label (all repos)
 # ============================================================
-# Place this file in ONE repo only (e.g. your PM / issues repo).
+# Place this file in ONE repo only (e.g. your PM / issues repo):
+#   - issues-repo/.github/workflows/sync-project-to-label.yml
+#
 # The poll scans ALL items in the project, so it syncs labels
-# across every linked repo automatically.
+# across every linked repo (backend, frontend, issues) automatically.
 #
 # ENVIRONMENT (dev):
-#   Secrets:   PROJECT_TOKEN  (classic PAT: repo + project + read:org if org)
+#   Secrets:   APP_ID, APP_PRIVATE_KEY
 #   Variables: OWNER_NAME, OWNER_TYPE, PROJECT_NUMBER, FIELD_NAME
 # ============================================================
 
@@ -16,7 +18,7 @@ on:
   schedule:
     - cron: '*/15 * * * *'   # Adjust frequency as needed (min: '* * * * *')
 
-  workflow_dispatch: {}      # Allows manual run from Actions UI with no inputs needed
+  workflow_dispatch: {}
 
 jobs:
   project-to-label:
@@ -26,10 +28,18 @@ jobs:
     permissions:
       issues: write
     steps:
+      - name: Generate bot token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ vars.OWNER_NAME }}
+
       - name: Poll project and sync labels across all repos
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.PROJECT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const PRIORITIES = ['P0', 'P1', 'P2'];
             const ownerName  = '${{ vars.OWNER_NAME }}';
