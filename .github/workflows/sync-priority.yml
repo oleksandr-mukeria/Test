@@ -1,0 +1,254 @@
+# ============================================================
+# Sync Priority Label ↔ GitHub Project Field (Bidirectional)
+# ============================================================
+#
+# SETUP CHECKLIST:
+#   1. Set ORG_NAME, PROJECT_NUMBER, and FIELD_NAME below.
+#   2. Create labels P0, P1, P2 in every repo that uses this workflow.
+#   3. Create a secret PROJECT_TOKEN (classic PAT) with scopes:
+#        • repo          (issues read/write)
+#        • read:org
+#        • project       (read/write Projects)
+#      Store it as a repository (or org) secret named PROJECT_TOKEN.
+#
+# HOW IT WORKS:
+#   Label  → Project  When a P0/P1/P2 label is added or removed
+#                     from an issue, the corresponding ProjectV2
+#                     single-select field is updated to match.
+#
+#   Project → Label   When the Priority field of a ProjectV2 item
+#                     is changed, the matching label is applied to
+#                     the linked issue (old priority labels removed).
+#
+# NOTE: The projects_v2_item trigger fires at the org level.
+#       Place this file in .github/workflows/ of a repo that
+#       belongs to the org, or in a dedicated automation repo.
+# ============================================================
+
+name: Sync Priority Label ↔ Project Field
+
+on:
+  issues:
+    types: [labeled, unlabeled]
+  projects_v2_item:
+    types: [edited]
+
+env:
+  ORG_NAME: your-org        # ← Your GitHub organization login
+  PROJECT_NUMBER: "1"       # ← Your project number (from the project URL)
+  FIELD_NAME: Priority      # ← Exact name of the single-select field in the project
+
+# ── Direction 1: Issue label changed → update Project field ──────────────────
+jobs:
+  label-to-project:
+    name: "Label → Project Field"
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+    steps:
+      - name: Sync priority label to project field
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const PRIORITIES = ['P0', 'P1', 'P2'];
+            const org          = process.env.ORG_NAME;
+            const projectNum   = parseInt(process.env.PROJECT_NUMBER, 10);
+            const fieldName    = process.env.FIELD_NAME;
+
+            const issue       = context.payload.issue;
+            const issueNodeId = issue.node_id;
+
+            // ── Determine the current priority label on the issue ──────────
+            const activeLabel = issue.labels
+              .map(l => l.name)
+              .find(n => PRIORITIES.includes(n)) ?? null;
+
+            core.info(`Issue #${issue.number} — active priority label: ${activeLabel ?? '(none)'}`);
+
+            // ── Fetch project metadata (id + field options) ────────────────
+            const { organization } = await github.graphql(`
+              query($org: String!, $num: Int!) {
+                organization(login: $org) {
+                  projectV2(number: $num) {
+                    id
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options { id name }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { org, num: projectNum });
+
+            const project = organization.projectV2;
+            const field   = project.fields.nodes.find(f => f.name === fieldName);
+
+            if (!field) {
+              core.setFailed(`Field "${fieldName}" not found in project #${projectNum}. ` +
+                `Available fields: ${project.fields.nodes.map(f => f.name).join(', ')}`);
+              return;
+            }
+
+            // ── Find the project item linked to this issue ─────────────────
+            const { node } = await github.graphql(`
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on Issue {
+                    projectItems(first: 20) {
+                      nodes { id project { id } }
+                    }
+                  }
+                }
+              }
+            `, { id: issueNodeId });
+
+            const projectItem = node.projectItems.nodes
+              .find(item => item.project.id === project.id);
+
+            if (!projectItem) {
+              core.warning(`Issue #${issue.number} is not in project #${projectNum} — skipping.`);
+              return;
+            }
+
+            // ── Apply or clear the field value ─────────────────────────────
+            if (activeLabel) {
+              const option = field.options.find(o => o.name === activeLabel);
+              if (!option) {
+                core.setFailed(
+                  `Option "${activeLabel}" not found in field "${fieldName}". ` +
+                  `Available options: ${field.options.map(o => o.name).join(', ')}`
+                );
+                return;
+              }
+
+              await github.graphql(`
+                mutation($pid: ID!, $iid: ID!, $fid: ID!, $oid: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $pid
+                    itemId:    $iid
+                    fieldId:   $fid
+                    value:     { singleSelectOptionId: $oid }
+                  }) { projectV2Item { id } }
+                }
+              `, { pid: project.id, iid: projectItem.id, fid: field.id, oid: option.id });
+
+              core.info(`✅  Set "${fieldName}" → "${activeLabel}" for issue #${issue.number}`);
+            } else {
+              // No priority label left — clear the project field
+              await github.graphql(`
+                mutation($pid: ID!, $iid: ID!, $fid: ID!) {
+                  clearProjectV2ItemFieldValue(input: {
+                    projectId: $pid
+                    itemId:    $iid
+                    fieldId:   $fid
+                  }) { projectV2Item { id } }
+                }
+              `, { pid: project.id, iid: projectItem.id, fid: field.id });
+
+              core.info(`✅  Cleared "${fieldName}" for issue #${issue.number}`);
+            }
+
+# ── Direction 2: Project field changed → update Issue label ──────────────────
+  project-to-label:
+    name: "Project Field → Label"
+    if: github.event_name == 'projects_v2_item'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Sync project field to issue label
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const PRIORITIES = ['P0', 'P1', 'P2'];
+            const fieldName  = process.env.FIELD_NAME;
+
+            const itemNodeId = context.payload.projects_v2_item.node_id;
+
+            // ── Fetch item content + all field values ──────────────────────
+            const { node } = await github.graphql(`
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on ProjectV2Item {
+                    content {
+                      ... on Issue {
+                        id
+                        number
+                        labels(first: 30) { nodes { name } }
+                        repository {
+                          name
+                          owner { login }
+                        }
+                      }
+                    }
+                    fieldValues(first: 30) {
+                      nodes {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                          field {
+                            ... on ProjectV2SingleSelectField { name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { id: itemNodeId });
+
+            // Only handle Issues (not PRs or Draft items)
+            if (!node?.content?.number) {
+              core.warning('Project item is not linked to an Issue — skipping.');
+              return;
+            }
+
+            const issue = node.content;
+
+            // ── Find the new priority value from the project field ─────────
+            const priorityFieldValue = node.fieldValues.nodes
+              .find(fv => fv.field?.name === fieldName);
+
+            const newPriority = (priorityFieldValue?.name ?? null);
+
+            // Guard: only act on recognized priority values (or clear)
+            if (newPriority && !PRIORITIES.includes(newPriority)) {
+              core.info(`Field changed to "${newPriority}" which is not a priority value — skipping.`);
+              return;
+            }
+
+            core.info(`Issue #${issue.number} — project field "${fieldName}" is now: ${newPriority ?? '(empty)'}`);
+
+            const owner        = issue.repository.owner.login;
+            const repo         = issue.repository.name;
+            const issueNumber  = issue.number;
+            const currentLabels = issue.labels.nodes.map(l => l.name);
+
+            // ── Remove stale priority labels ───────────────────────────────
+            const toRemove = currentLabels.filter(
+              l => PRIORITIES.includes(l) && l !== newPriority
+            );
+
+            for (const label of toRemove) {
+              await github.rest.issues.removeLabel({
+                owner, repo, issue_number: issueNumber, name: label,
+              });
+              core.info(`  🗑  Removed label "${label}"`);
+            }
+
+            // ── Add the new priority label if not already present ──────────
+            if (newPriority && !currentLabels.includes(newPriority)) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: issueNumber, labels: [newPriority],
+              });
+              core.info(`  🏷  Added label "${newPriority}"`);
+            }
+
+            core.info(`✅  Labels synced for issue #${issueNumber}`);
