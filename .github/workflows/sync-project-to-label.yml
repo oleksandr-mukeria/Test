@@ -1,0 +1,152 @@
+# ============================================================
+# Sync Project Field → Priority Label (all repos)
+# ============================================================
+# Place this file in ONE repo only (e.g. your PM / issues repo).
+# The poll scans ALL items in the project, so it syncs labels
+# across every linked repo automatically.
+#
+# ENVIRONMENT (dev):
+#   Secrets:   PROJECT_TOKEN  (classic PAT: repo + project + read:org if org)
+#   Variables: OWNER_NAME, OWNER_TYPE, PROJECT_NUMBER, FIELD_NAME
+# ============================================================
+
+name: Sync Project Field → Priority Label
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # Adjust frequency as needed (min: '* * * * *')
+
+  workflow_dispatch: {}      # Allows manual run from Actions UI with no inputs needed
+
+jobs:
+  project-to-label:
+    name: "Project Field → Label (all repos)"
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      issues: write
+    steps:
+      - name: Poll project and sync labels across all repos
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const PRIORITIES = ['P0', 'P1', 'P2'];
+            const ownerName  = '${{ vars.OWNER_NAME }}';
+            const ownerType  = '${{ vars.OWNER_TYPE }}';
+            const projectNum = parseInt('${{ vars.PROJECT_NUMBER }}', 10);
+            const fieldName  = '${{ vars.FIELD_NAME }}';
+
+            // ── Paginate through all project items ─────────────────────────
+            const itemsQuery = ownerType === 'org'
+              ? `query($owner: String!, $num: Int!, $cursor: String) {
+                   organization(login: $owner) { projectV2(number: $num) {
+                     items(first: 100, after: $cursor) {
+                       pageInfo { hasNextPage endCursor }
+                       nodes {
+                         content {
+                           ... on Issue {
+                             number
+                             labels(first: 30) { nodes { name } }
+                             repository { name owner { login } }
+                           }
+                         }
+                         fieldValues(first: 30) { nodes {
+                           ... on ProjectV2ItemFieldSingleSelectValue {
+                             name
+                             field { ... on ProjectV2SingleSelectField { name } }
+                           }
+                         }}
+                       }
+                     }
+                   }}
+                 }`
+              : `query($owner: String!, $num: Int!, $cursor: String) {
+                   user(login: $owner) { projectV2(number: $num) {
+                     items(first: 100, after: $cursor) {
+                       pageInfo { hasNextPage endCursor }
+                       nodes {
+                         content {
+                           ... on Issue {
+                             number
+                             labels(first: 30) { nodes { name } }
+                             repository { name owner { login } }
+                           }
+                         }
+                         fieldValues(first: 30) { nodes {
+                           ... on ProjectV2ItemFieldSingleSelectValue {
+                             name
+                             field { ... on ProjectV2SingleSelectField { name } }
+                           }
+                         }}
+                       }
+                     }
+                   }}
+                 }`;
+
+            let cursor     = null;
+            const allItems = [];
+
+            do {
+              const data = await github.graphql(itemsQuery, { owner: ownerName, num: projectNum, cursor });
+              const page = (ownerType === 'org' ? data.organization : data.user).projectV2.items;
+              allItems.push(...page.nodes);
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
+
+            core.info(`Found ${allItems.length} project items across all repos`);
+
+            // Track stats per repo for summary log
+            const stats = {};
+
+            // ── Reconcile labels for each linked issue ─────────────────────
+            for (const item of allItems) {
+              const issue = item.content;
+              if (!issue?.number) continue;   // skip PRs and draft items
+
+              const priorityFv = item.fieldValues.nodes
+                .find(fv => fv.field?.name === fieldName);
+              const projectPriority = priorityFv?.name ?? null;
+
+              if (projectPriority && !PRIORITIES.includes(projectPriority)) continue;
+
+              const owner         = issue.repository.owner.login;
+              const repo          = issue.repository.name;
+              const issueNumber   = issue.number;
+              const currentLabels = issue.labels.nodes.map(l => l.name);
+              const repoKey       = `${owner}/${repo}`;
+
+              if (!stats[repoKey]) stats[repoKey] = { checked: 0, updated: 0 };
+              stats[repoKey].checked++;
+
+              const toRemove = currentLabels.filter(
+                l => PRIORITIES.includes(l) && l !== projectPriority
+              );
+              const needsAdd = projectPriority && !currentLabels.includes(projectPriority);
+
+              if (toRemove.length === 0 && !needsAdd) continue;   // already in sync
+
+              for (const label of toRemove) {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: issueNumber, name: label,
+                });
+                core.info(`  🗑  [${repoKey}] #${issueNumber}: removed "${label}"`);
+              }
+
+              if (needsAdd) {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: issueNumber, labels: [projectPriority],
+                });
+                core.info(`  🏷  [${repoKey}] #${issueNumber}: added "${projectPriority}"`);
+              }
+
+              stats[repoKey].updated++;
+            }
+
+            // ── Summary ────────────────────────────────────────────────────
+            core.info('');
+            core.info('── Summary ──────────────────────────────────');
+            for (const [repo, { checked, updated }] of Object.entries(stats)) {
+              core.info(`  ${repo}: ${checked} issues checked, ${updated} updated`);
+            }
+            core.info('✅  Poll complete');
