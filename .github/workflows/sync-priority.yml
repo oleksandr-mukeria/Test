@@ -47,6 +47,7 @@ on:
 jobs:
   label-to-project:
     name: "Label → Project Field"
+    environment: dev
     if: |
       github.event_name == 'issues' ||
       (github.event_name == 'workflow_dispatch' && inputs.direction == 'label-to-project')
@@ -188,6 +189,7 @@ jobs:
 # ── Direction 2: Poll project → reconcile Issue labels ───────────────────────
   project-to-label:
     name: "Project Field → Label (poll)"
+    environment: dev
     if: |
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.direction == 'project-to-label')
